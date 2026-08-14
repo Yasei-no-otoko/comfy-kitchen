@@ -404,7 +404,7 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 
 // act_code folds an elementwise activation into the rotation's load.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
-                           nb::object spill_rotated, nb::object spill_partials, int M, int K,
+                           OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -420,8 +420,8 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
-    if (!spill_rotated.is_none()) {
-        auto rotated = nb::cast<nb::ndarray<>>(spill_rotated);
+    if (spill_rotated.has_value()) {
+        const auto& rotated = *spill_rotated;
         require_dtype(rotated, 0, 2, kFn, "spill_rotated");
         require_len(rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
         if (map_dtype_to_code(rotated.dtype()) != map_dtype_to_code(x.dtype())) {
@@ -429,8 +429,8 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         }
         spill_rotated_ptr = rotated.data();
     }
-    if (!spill_partials.is_none()) {
-        auto partials = nb::cast<nb::ndarray<>>(spill_partials);
+    if (spill_partials.has_value()) {
+        const auto& partials = *spill_partials;
         require_dtype(partials, 0, 0, kFn, "spill_partials");
         require_len(partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
         spill_partials_ptr = partials.data();
