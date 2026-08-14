@@ -1,6 +1,6 @@
 """Sol-Attn sparse attention.
 
-The CUDA backend runs INT8 internally, so tests assert cosine similarity (not
+The fused backends run INT8 internally, so tests assert cosine similarity (not
 bitwise equality) against the full-precision eager reference, plus the
 invariants that have actually broken in development: batch > 1, sinks, the
 routed-index cap, and ragged tails.
@@ -34,8 +34,24 @@ def _cos(a, b):
 
 def _dense(q, k, v):
     qq, kk, vv = (x.permute(0, 2, 1, 3).float() for x in (q, k, v))
-    out = torch.nn.functional.scaled_dot_product_attention(qq, kk, vv, scale=HD ** -0.5)
+    if torch.version.hip is not None:
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                qq, kk, vv, scale=HD ** -0.5
+            )
+    else:
+        out = torch.nn.functional.scaled_dot_product_attention(qq, kk, vv, scale=HD ** -0.5)
     return out.permute(0, 2, 1, 3)
+
+
+def _native_backend():
+    if torch.version.hip is not None:
+        from comfy_kitchen.backends import hip
+
+        return hip
+    from comfy_kitchen.backends import cuda
+
+    return cuda
 
 
 @pytest.mark.parametrize("t", [256, 1024, 2048])
@@ -45,6 +61,23 @@ def test_matches_eager_reference(t, tau):
     got = ck.sol_attn(q, k, v, tau=tau)
     ref = sol_attn_eager(q, k, v, tau=tau)
     assert _cos(got, ref) > 0.998
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="HIP compile contract")
+def test_torch_compile_hip():
+    q, k, v = _qkv(1, 256, 4, seed=123)
+
+    def run(q, k, v):
+        return ck.sol_attn(q, k, v, tau=1.5, max_blocks=8, centroid_tail=True)
+
+    expected = run(q, k, v)
+    compiled = torch.compile(run, fullgraph=True)
+    actual = compiled(q, k, v)
+    replay = compiled(q, k, v)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(replay, actual)
+    assert torch.isfinite(actual).all()
 
 
 @pytest.mark.parametrize("t", [1000, 1088, 3137])
@@ -124,6 +157,7 @@ def test_cap_never_falls_below_the_no_exact_blocks_floor(cap):
     assert got >= floor - 2e-3, f"cap={cap} scored {got:.6f}, below the {floor:.6f} floor"
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA workspace contract")
 def test_max_blocks_reaches_the_kernel():
     """A silently dropped cap still returns a finite, plausible result, so a
     tight cap must visibly change the output and shrink the workspace."""
@@ -132,7 +166,7 @@ def test_max_blocks_reaches_the_kernel():
     capped = ck.sol_attn(q, k, v, tau=0.5, max_blocks=2)
     assert not torch.equal(uncapped, capped)
 
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     assert (cuda_backend.sol_attn_workspace_bytes(1, 4096, 4, 2)
             < cuda_backend.sol_attn_workspace_bytes(1, 4096, 4))
 
@@ -157,7 +191,7 @@ def test_strided_inputs(b):
 def test_rejects_noncontiguous_last_dim():
     """The staging loads are 16 B wide, so a strided last dim would read
     neighbouring channels rather than fail."""
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     _q, k, v = _qkv(1, 256, 4)
     bad = torch.empty(1, 256, 4, HD * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
     assert bad.stride(-1) != 1
@@ -195,10 +229,11 @@ def test_tau_monotonicity():
     assert sims[0] >= sims[1] >= sims[2] - 1e-3
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA workspace contract")
 def test_workspace_reuse():
     """A caller-supplied workspace must give the same answer, and a short one
     must be rejected rather than overrun."""
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     q, k, v = _qkv(1, 1024, 4)
     nbytes = cuda_backend.sol_attn_workspace_bytes(1, 1024, 4)
     ws = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
@@ -236,7 +271,7 @@ def test_output_strides_agree_across_backends():
 def test_unaligned_input_is_rejected():
     """An odd storage_offset passes the contiguous-last-dim test but faults the
     16 B staging loads with a context-poisoning misaligned address."""
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     n = 1 * 256 * 4 * HD
     base = torch.randn(n + 8, device="cuda", dtype=torch.bfloat16)
     bad = base[1:1 + n].view(1, 256, 4, HD)
@@ -248,7 +283,7 @@ def test_unaligned_input_is_rejected():
 def test_misaligned_stride_is_rejected():
     """An aligned base is not enough: a padded-row layout (a 132-wide buffer
     sliced back to 128) puts rows at +264 B, misaligning the 16 B loads."""
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     base = torch.randn(1, 256, 4, HD + 4, device="cuda", dtype=torch.bfloat16)
     bad = base[..., :HD]
     assert bad.stride(-1) == 1 and bad.data_ptr() % 16 == 0 and bad.stride(2) % 8
@@ -330,7 +365,7 @@ def test_key_bias_inf_masks_out_keys():
 
 
 def test_key_bias_bad_shape_rejected():
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     q, k, v = _qkv(1, 256, 4)
     with pytest.raises(ValueError, match="key_bias"):
         cuda_backend.sol_attn(q, k, v, tau=1.4,
@@ -380,7 +415,7 @@ def test_direct_backend_validates_like_the_public_path():
     """The backend-direct entry (the workspace-reusing path) must run the same
     shared rule as the registry: fp16 once ran silently to plausible garbage
     (bytes reinterpreted as bf16) and a shorter k read out of bounds."""
-    from comfy_kitchen.backends import cuda as cuda_backend
+    cuda_backend = _native_backend()
     q, k, v = _qkv(1, 512, 4)
     with pytest.raises(ValueError, match="bfloat16"):
         cuda_backend.sol_attn(q.half(), k.half(), v.half(), tau=1.4)
@@ -388,6 +423,7 @@ def test_direct_backend_validates_like_the_public_path():
         cuda_backend.sol_attn(q, k[:, :256].contiguous(), v, tau=1.4)
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA workspace contract")
 def test_workspace_must_be_aligned_and_contiguous():
     """A workspace view with an odd storage_offset passes the byte-count check
     and then faults with a context-poisoning misaligned address; a strided view
@@ -404,6 +440,7 @@ def test_workspace_must_be_aligned_and_contiguous():
                                                     device="cuda")[:, 0])
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA capability contract")
 def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
     """The sm_75 cubins in a full-arch build compile the guarded kernel bodies
     to a bare EXIT (verified in SASS), and the unguarded preprocess still runs,

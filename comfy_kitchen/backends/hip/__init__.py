@@ -72,6 +72,7 @@ __all__ = [
     "sage_int8_attend",
     "sage_int8_quantize",
     "sage_int8_sdpa",
+    "sol_attn",
     "quantize_and_rotate_rowwise",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_convrot_weight",
@@ -120,6 +121,12 @@ except Exception as e:  # a broken extension must not break import
         del sys.modules["comfy_kitchen.backends.hip._C"]
     _EXT_ERROR = f"Failed to load HIP extension: {e}"
     _C = None
+
+try:
+    from .sol_attn_triton import sol_attn
+    _SOL_ATTN_TRITON_AVAILABLE = True
+except ImportError:
+    _SOL_ATTN_TRITON_AVAILABLE = False
 
 
 def _gfx_arch(device: torch.device | int | None = None) -> str | None:
@@ -1713,6 +1720,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ParamConstraint,
         ValidationResult,
         na3d_common_call_rule,
+        sol_attn_common_call_rule,
     )
 
     # PyTorch exposes ROCm tensors with device type "cuda".
@@ -2010,6 +2018,23 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             default_devices=dev,
         ),
     }
+
+    if has_wmma and _SOL_ATTN_TRITON_AVAILABLE:
+        constraints["sol_attn"] = FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(4),)
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(4),)
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(4),)
+                ),
+            },
+            default_devices=dev,
+            call_rules=(sol_attn_common_call_rule,),
+        )
 
     # Same operands and the same kernel as the functional siblings.
     for inplace_name, functional_name in {
