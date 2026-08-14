@@ -33,6 +33,13 @@ def _nrmse(actual, expected):
     return (error / magnitude).item()
 
 
+def _sdpa(*args, **kwargs):
+    if torch.version.hip is not None:
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            return torch.nn.functional.scaled_dot_product_attention(*args, **kwargs)
+    return torch.nn.functional.scaled_dot_product_attention(*args, **kwargs)
+
+
 def test_int8_attention_availability_is_bool():
     assert isinstance(ck.int8_attention_is_available(), bool)
 
@@ -125,7 +132,7 @@ def test_int8_attention_matches_sdpa(dtype, head_dim):
     assert not q.is_contiguous()
 
     actual = ck.int8_attention(q, k, v)
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    expected = _sdpa(q, k, v)
 
     assert actual.shape == expected.shape
     assert actual.dtype == dtype
@@ -153,7 +160,7 @@ def test_int8_attention_rejects_removed_options(option):
 def test_int8_attention_gqa_and_unequal_lengths():
     q, k, v = _qkv(1, 16, 4, 191, 257, 128)
     actual = ck.int8_attention(q, k, v, scale=0.07)
-    expected = torch.nn.functional.scaled_dot_product_attention(
+    expected = _sdpa(
         q,
         k.repeat_interleave(4, dim=1),
         v.repeat_interleave(4, dim=1),
@@ -177,7 +184,7 @@ def test_int8_attention_batch_two_direct_and_prequantized(masked):
     actual = ck.int8_attention(q, k, v, attn_mask=mask)
     quantized = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
     prequantized = ck.int8_attention_from_prequantized(quantized)
-    expected = torch.nn.functional.scaled_dot_product_attention(
+    expected = _sdpa(
         q,
         k.repeat_interleave(4, dim=1),
         v.repeat_interleave(4, dim=1),
@@ -205,7 +212,7 @@ def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_d
     baseline_mask = mask
     if mask.dtype != torch.bool and mask.dtype != q.dtype:
         baseline_mask = mask.to(q.dtype)
-    expected = torch.nn.functional.scaled_dot_product_attention(
+    expected = _sdpa(
         q,
         k.repeat_interleave(4, dim=1),
         v.repeat_interleave(4, dim=1),
@@ -235,7 +242,7 @@ def test_int8_attention_key_broadcast_mask(mask_dtype):
     baseline_mask = mask
     if mask.dtype != torch.bool and mask.dtype != q.dtype:
         baseline_mask = mask.to(q.dtype)
-    expected = torch.nn.functional.scaled_dot_product_attention(
+    expected = _sdpa(
         q,
         k.repeat_interleave(4, dim=1),
         v.repeat_interleave(4, dim=1),
@@ -271,7 +278,7 @@ def test_int8_attention_stabilizes_large_common_key_component():
     )
     common_key.mul_(40.0 / common_key.square().mean(-1, keepdim=True).sqrt())
     k.add_(common_key.to(k.dtype))
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    expected = _sdpa(q, k, v)
 
     actual = ck.int8_attention(q, k, v)
 
@@ -405,7 +412,7 @@ def test_int8_attention_cuda_graph():
     with torch.cuda.graph(graph):
         actual = ck.int8_attention(q, k, v)
     graph.replay()
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    expected = _sdpa(q, k, v)
     assert _nrmse(actual, expected) < 0.03
 
 
@@ -417,7 +424,7 @@ def test_rotation_handles_outliers():
     k[..., 0].mul_(12)
     q.mul_(q.float().square().mean(-1, keepdim=True).rsqrt().to(q.dtype))
     k.mul_(k.float().square().mean(-1, keepdim=True).rsqrt().to(k.dtype))
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    expected = _sdpa(q, k, v)
 
     actual = ck.int8_attention(q, k, v)
 

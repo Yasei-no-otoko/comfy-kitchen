@@ -89,7 +89,11 @@ def _reference(q, k, v, lengths):
         query = q[batch].transpose(0, 1).unsqueeze(0)
         key = k[batch, :length].transpose(0, 1).repeat_interleave(groups, dim=0).unsqueeze(0)
         value = v[batch, :length].transpose(0, 1).repeat_interleave(groups, dim=0).unsqueeze(0)
-        output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+        if torch.version.hip is not None:
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+        else:
+            output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
         outputs.append(output.squeeze(0).transpose(0, 1))
     return torch.stack(outputs)
 
