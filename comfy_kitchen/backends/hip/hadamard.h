@@ -141,13 +141,19 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
+__forceinline__ __device__ float hadamard4(int row, float v0, float v1, float v2, float v3) {
+    if (row == 0) return v0 + v1 + v2 - v3;
+    if (row == 1) return v0 + v1 - v2 + v3;
+    if (row == 2) return v0 - v1 + v2 + v3;
+    return -v0 + v1 + v2 + v3;
+}
+
 template <typename RowT, bool PACK_INT4, int ACT = kActNone>
 __global__ __launch_bounds__(256) void convrot_quant_kernel(
     const void* __restrict__ x, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
     int M, int K, int G) {
 
-    const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
     __shared__ float g[256];
     __shared__ float red[256];
     extern __shared__ unsigned char rowbuf_raw[];
@@ -173,22 +179,39 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     for (int gbase = 0; gbase < ngrp; gbase += gpw) {
         const int grp = gbase + glocal;
         const bool active = grp < ngrp;
-        g[t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
-        __syncthreads();
+        float v = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
+        const int lane = t & 31;
 
-        for (int stage = 0; stage < nstages; ++stage) {
-            const int stride = 1 << (2 * stage);
-            const int ds = (e / stride) & 3;
-            const int b = gbase_idx + (e - ds * stride);
-            const float v0 = g[b], v1 = g[b + stride], v2 = g[b + 2 * stride], v3 = g[b + 3 * stride];
-            const float nv = h4[ds][0] * v0 + h4[ds][1] * v1 + h4[ds][2] * v2 + h4[ds][3] * v3;
+        if (nstages >= 1) {
+            const int b = lane & ~3;
+            v = hadamard4(e & 3, __shfl(v, b), __shfl(v, b + 1),
+                          __shfl(v, b + 2), __shfl(v, b + 3));
+        }
+        if (nstages >= 2) {
+            const int b = lane & ~15;
+            const int p = e & 3;
+            v = hadamard4((e >> 2) & 3, __shfl(v, b + p), __shfl(v, b + p + 4),
+                          __shfl(v, b + p + 8), __shfl(v, b + p + 12));
+        }
+        if (nstages >= 3) {
+            g[t] = v;
             __syncthreads();
-            g[t] = nv;
+            const int ds = (e >> 4) & 3;
+            const int b = gbase_idx + (e - ds * 16);
+            v = hadamard4(ds, g[b], g[b + 16], g[b + 32], g[b + 48]);
+            __syncthreads();
+        }
+        if (nstages >= 4) {
+            g[t] = v;
+            __syncthreads();
+            const int ds = (e >> 6) & 3;
+            const int b = gbase_idx + (e - ds * 64);
+            v = hadamard4(ds, g[b], g[b + 64], g[b + 128], g[b + 192]);
             __syncthreads();
         }
 
         if (active) {
-            const float tv = g[t] * norm;
+            const float tv = v * norm;
             const RowT stored = store_row_value<RowT>(tv);
             rowbuf[static_cast<int64_t>(grp) * G + e] = stored;
             lmax = fmaxf(lmax, fabsf(load_row_value(stored)));
