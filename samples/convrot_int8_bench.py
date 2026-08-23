@@ -2,7 +2,6 @@ import argparse
 import gc
 import json
 import statistics
-import time
 from pathlib import Path
 
 import torch
@@ -92,12 +91,15 @@ def measure(fn):
     for _ in range(args.warmup):
         fn()
     torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     samples = []
     for _ in range(args.iterations):
-        start = time.perf_counter()
+        start.record()
         fn()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1000)
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
     return samples
 
 
